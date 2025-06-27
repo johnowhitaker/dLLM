@@ -460,21 +460,46 @@ def train_model(model: Any, tokenizer: Any, train_ds, val_ds, config: TrainingCo
     
     # Training loop
     model.train()
+    
+    # Create a unified progress bar based on steps, not epochs
+    if config.max_train_steps is not None:
+        # Use step-based progress bar
+        total_steps_for_pbar = config.max_train_steps
+        pbar_desc = "Training Steps"
+        use_step_pbar = True
+    else:
+        # Use epoch-based progress bar (traditional)
+        total_steps_for_pbar = sum(len(range(0, len(train_ds), config.batch_size)) for _ in range(max_epochs))
+        pbar_desc = "Training"
+        use_step_pbar = False
+    
+    # Create the main progress bar
+    main_pbar = tqdm(
+        total=total_steps_for_pbar,
+        desc=pbar_desc,
+        dynamic_ncols=True,
+        leave=True
+    )
+    
+    running_loss = 0.0
+    running_acc = 0.0
+    step_count = 0
+    optimizer.zero_grad()
+    
     for epoch in range(max_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
+        if not use_step_pbar:
+            print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
         
-        pbar = tqdm(
+        epoch_pbar = tqdm(
             train_loader, 
-            desc=f"Epoch {epoch + 1}", 
+            desc=f"Epoch {epoch + 1}" if not use_step_pbar else "Current Batch", 
             leave=False, 
-            dynamic_ncols=True
+            dynamic_ncols=True,
+            disable=use_step_pbar  # Disable epoch pbar when using step-based tracking
         )
         
-        running_loss = 0.0
-        running_acc = 0.0
-        optimizer.zero_grad()
-        
-        for step, batch in enumerate(pbar, 1):
+        for step, batch in enumerate(epoch_pbar, 1):
+            step_count += 1
             batch = {k: v.to(device) for k, v in batch.items()}
             
             # Forward pass
@@ -494,6 +519,18 @@ def train_model(model: Any, tokenizer: Any, train_ds, val_ds, config: TrainingCo
                 optimizer.zero_grad()
                 global_step += 1
                 
+                # Update main progress bar
+                if use_step_pbar:
+                    main_pbar.update(1)
+                    main_pbar.set_postfix(
+                        loss=f"{running_loss / step:.4f}",
+                        acc=f"{running_acc / step:.3f}",
+                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                        step=global_step
+                    )
+                else:
+                    main_pbar.update(1)
+                
                 # Log to W&B
                 if config.use_wandb:
                     wandb.log({
@@ -503,17 +540,18 @@ def train_model(model: Any, tokenizer: Any, train_ds, val_ds, config: TrainingCo
                         "train/step": global_step,
                     })
             
-            # Update progress bar
-            if step % 20 == 0 or step == 1:
-                pbar.set_postfix(
-                    loss=running_loss / step,
-                    acc=running_acc / step,
+            # Update epoch progress bar (only when not using step-based)
+            if not use_step_pbar and (step % 20 == 0 or step == 1):
+                epoch_pbar.set_postfix(
+                    loss=f"{running_loss / step:.4f}",
+                    acc=f"{running_acc / step:.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}"
                 )
             
             # Check if we've reached max steps
             if config.max_train_steps is not None and global_step >= config.max_train_steps:
                 print(f"\n🏁 Reached max_train_steps ({config.max_train_steps}), stopping training")
+                epoch_pbar.close()
                 break
             
             # Validation
@@ -546,9 +584,14 @@ def train_model(model: Any, tokenizer: Any, train_ds, val_ds, config: TrainingCo
                 
                 model.train()  # Back to train mode
         
+        epoch_pbar.close()
+        
         # Break out of epoch loop if max steps reached
         if config.max_train_steps is not None and global_step >= config.max_train_steps:
             break
+    
+    # Close main progress bar
+    main_pbar.close()
     
     # Final save
     save_model(model, tokenizer, config)
